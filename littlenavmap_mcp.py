@@ -1,20 +1,25 @@
 """
 Little Navmap MCP Server
 ========================
-Expone la WebAPI REST de Little Navmap (http://localhost:8965) como tools MCP.
+Expone la WebAPI REST de Little Navmap (http://127.0.0.1:8965) como tools MCP.
 Requiere que Little Navmap esté corriendo con el web server activo
 (Tools → Run Web Server).
 
 Endpoints cubiertos (LNM WebAPI v3.0):
   - /api/airport/info          → lnm_airport_info
   - /api/airport/weather       → lnm_airport_weather
-  - /api/map/features          → lnm_map_features
   - /api/aircraft/info         → lnm_aircraft_info (sim conectado)
+  - /api/aircraft/progress     → lnm_aircraft_progress (sim conectado)
   - /api/sim/info              → lnm_sim_info
   - /api/flightplan            → lnm_flightplan_get
   - /api/ui/info               → lnm_ui_info
+  - /api/map/image             → lnm_map_image
 
-Uso (stdio, para Claude Desktop / claude.ai):
+Endpoints via SQLite directo (no existen en WebAPI v3.0.18):
+  - lnm_navaid_search          → tablas vor, ndb del SQLite de LNM
+  - lnm_map_features           → tablas vor, ndb, airport del SQLite de LNM
+
+Uso (stdio, para Claude Desktop):
   python littlenavmap_mcp.py
 
 Configuración claude_desktop_config.json:
@@ -24,8 +29,9 @@ Configuración claude_desktop_config.json:
         "command": "python",
         "args": ["C:/ruta/a/littlenavmap_mcp.py"],
         "env": {
-          "LNM_HOST": "localhost",
-          "LNM_PORT": "8965"
+          "LNM_HOST": "127.0.0.1",
+          "LNM_PORT": "8965",
+          "LNM_DB_PATH": "C:/Users/TU_USUARIO/AppData/Roaming/ABarthel/little_navmap_db/little_navmap_msfs24.sqlite"
         }
       }
     }
@@ -34,6 +40,7 @@ Configuración claude_desktop_config.json:
 
 import json
 import os
+import sqlite3
 from typing import Optional
 
 import httpx
@@ -42,15 +49,22 @@ from pydantic import BaseModel, ConfigDict, Field
 
 # ─── Configuración ────────────────────────────────────────────────────────────
 
-LNM_HOST = os.getenv("LNM_HOST", "localhost")
+LNM_HOST = os.getenv("LNM_HOST", "127.0.0.1")
 LNM_PORT = os.getenv("LNM_PORT", "8965")
 BASE_URL = f"http://{LNM_HOST}:{LNM_PORT}"
 TIMEOUT = 10.0
 
+# Ruta al SQLite de LNM — configurable via variable de entorno
+_DEFAULT_DB = os.path.join(
+    os.environ.get("APPDATA", ""),
+    "ABarthel", "little_navmap_db", "little_navmap_msfs24.sqlite"
+)
+LNM_DB_PATH = os.getenv("LNM_DB_PATH", _DEFAULT_DB)
+
 mcp = FastMCP("littlenavmap_mcp")
 
 
-# ─── Cliente HTTP compartido ──────────────────────────────────────────────────
+# ─── Cliente HTTP ─────────────────────────────────────────────────────────────
 
 async def _get(path: str, params: Optional[dict] = None) -> dict:
     """Realiza GET a la WebAPI de LNM y devuelve JSON o lanza ValueError."""
@@ -75,10 +89,28 @@ async def _get(path: str, params: Optional[dict] = None) -> dict:
         raise ValueError(f"Timeout al contactar LNM en {url}.")
 
 
-def _fmt(data: dict) -> str:
-    """Serializa a JSON indentado."""
-    return json.dumps(data, indent=2, ensure_ascii=False)
+# ─── Cliente SQLite ───────────────────────────────────────────────────────────
 
+def _db_query(sql: str, params: tuple = ()) -> list[dict]:
+    """Ejecuta una query en el SQLite de LNM y devuelve lista de dicts."""
+    if not os.path.isfile(LNM_DB_PATH):
+        raise ValueError(
+            f"Base de datos de LNM no encontrada en '{LNM_DB_PATH}'. "
+            "Configura LNM_DB_PATH con la ruta correcta al archivo .sqlite."
+        )
+    conn = sqlite3.connect(LNM_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    try:
+        cursor = conn.execute(sql, params)
+        return [dict(row) for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _fmt(data) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False)
 
 def _err(e: Exception) -> str:
     return f"Error: {e}"
@@ -121,17 +153,12 @@ class MapImageInput(BaseModel):
     )
 
 
-# ─── Tools ────────────────────────────────────────────────────────────────────
+# ─── Tools — WebAPI ───────────────────────────────────────────────────────────
 
 @mcp.tool(
     name="lnm_airport_info",
-    annotations={
-        "title": "Información de aeropuerto",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations={"title": "Información de aeropuerto", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 async def lnm_airport_info(params: AirportIdent) -> str:
     """Obtiene información completa de un aeropuerto desde la base de datos de LNM.
@@ -157,13 +184,8 @@ async def lnm_airport_info(params: AirportIdent) -> str:
 
 @mcp.tool(
     name="lnm_airport_weather",
-    annotations={
-        "title": "Meteorología de aeropuerto",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": True,
-    },
+    annotations={"title": "Meteorología de aeropuerto", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
 )
 async def lnm_airport_weather(params: AirportIdent) -> str:
     """Obtiene la meteorología actual de un aeropuerto desde LNM.
@@ -187,57 +209,9 @@ async def lnm_airport_weather(params: AirportIdent) -> str:
 
 
 @mcp.tool(
-    name="lnm_map_features",
-    annotations={
-        "title": "Features del mapa en una región",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
-)
-async def lnm_map_features(params: MapFeaturesInput) -> str:
-    """Obtiene todos los features del mapa (aeropuertos, VORs, NDBs, waypoints,
-    airways, airspaces) dentro de un rectángulo geográfico.
-
-    Útil para explorar la navegación disponible en una región, identificar
-    navaids cercanos a una ruta o verificar restricciones de espacio aéreo.
-
-    Args:
-        params (MapFeaturesInput): Rectángulo definido por:
-            - toplat (float): Latitud norte
-            - bottomlat (float): Latitud sur
-            - leftlon (float): Longitud oeste
-            - rightlon (float): Longitud este
-
-    Returns:
-        str: JSON con arrays de airports, vors, ndbs, waypoints, airways
-             y airspaces dentro del rectángulo especificado.
-    """
-    try:
-        data = await _get(
-            "/api/map/features",
-            {
-                "toplat": params.toplat,
-                "bottomlat": params.bottomlat,
-                "leftlon": params.leftlon,
-                "rightlon": params.rightlon,
-            },
-        )
-        return _fmt(data)
-    except Exception as e:
-        return _err(e)
-
-
-@mcp.tool(
     name="lnm_aircraft_info",
-    annotations={
-        "title": "Estado del aircraft del simulador",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
+    annotations={"title": "Estado del aircraft del simulador", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
 async def lnm_aircraft_info() -> str:
     """Obtiene el estado actual del aircraft del simulador en tiempo real.
@@ -258,14 +232,34 @@ async def lnm_aircraft_info() -> str:
 
 
 @mcp.tool(
+    name="lnm_aircraft_progress",
+    annotations={"title": "Progreso de vuelo en tiempo real", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
+)
+async def lnm_aircraft_progress() -> str:
+    """Obtiene datos de progreso de vuelo del aircraft activo en el simulador.
+
+    Incluye información sobre el leg activo, próximo waypoint, distancia y
+    tiempo estimado a destino, bearing, altitud requerida, fuel restante y
+    estado de climb/descent. Equivale a la pestaña Progress de LNM.
+
+    Requiere simulador conectado y flight plan cargado en LNM.
+
+    Returns:
+        str: JSON con datos de progreso: waypoint activo, bearing to next,
+             distance remaining, ETE, fuel state y altitude requirements.
+    """
+    try:
+        data = await _get("/api/aircraft/progress")
+        return _fmt(data)
+    except Exception as e:
+        return _err(e)
+
+
+@mcp.tool(
     name="lnm_sim_info",
-    annotations={
-        "title": "Información del simulador",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
+    annotations={"title": "Información del simulador", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
 async def lnm_sim_info() -> str:
     """Obtiene el estado de la conexión con el simulador y datos generales de la sesión.
@@ -285,13 +279,8 @@ async def lnm_sim_info() -> str:
 
 @mcp.tool(
     name="lnm_flightplan_get",
-    annotations={
-        "title": "Flight plan activo en LNM",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations={"title": "Flight plan activo en LNM", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 async def lnm_flightplan_get() -> str:
     """Obtiene el flight plan actualmente cargado en Little Navmap.
@@ -314,13 +303,8 @@ async def lnm_flightplan_get() -> str:
 
 @mcp.tool(
     name="lnm_ui_info",
-    annotations={
-        "title": "Estado de la UI de LNM",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
+    annotations={"title": "Estado de la UI de LNM", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
 async def lnm_ui_info() -> str:
     """Obtiene información sobre el estado actual de la interfaz de LNM.
@@ -340,13 +324,8 @@ async def lnm_ui_info() -> str:
 
 @mcp.tool(
     name="lnm_map_image",
-    annotations={
-        "title": "Imagen del mapa de LNM",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations={"title": "Imagen del mapa de LNM", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 async def lnm_map_image(params: MapImageInput) -> str:
     """Obtiene la URL de la imagen del mapa actual de LNM para una región.
@@ -385,110 +364,199 @@ async def lnm_map_image(params: MapImageInput) -> str:
     return _fmt({"map_image_url": url, "params": query, "base_url": BASE_URL})
 
 
+# ─── Tools — SQLite directo ───────────────────────────────────────────────────
+
 @mcp.tool(
     name="lnm_navaid_search",
-    annotations={
-        "title": "Buscar navaid por ident",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False,
-    },
+    annotations={"title": "Buscar navaid por ident", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-async def lnm_navaid_search(
+def lnm_navaid_search(
     ident: str = Field(..., description="Identificador del navaid (e.g. 'BCN', 'TAU', 'AMTEL')", min_length=2, max_length=10),
 ) -> str:
-    """Busca información de un navaid (VOR, NDB, waypoint, ILS) por su identificador.
+    """Busca VORs y NDBs por identificador en la base de datos de LNM (SQLite directo).
 
-    Devuelve tipo, frecuencia (para VOR/NDB), coordenadas, región, rango y
-    otras propiedades del navaid.
+    Devuelve tipo, frecuencia, coordenadas, región, rango y nombre del navaid.
+    Busca simultáneamente en las tablas vor y ndb del SQLite de LNM.
+
+    Nota: Este endpoint no existe en la WebAPI de LNM 3.0.18 — se accede
+    directamente al SQLite en LNM_DB_PATH.
 
     Args:
         ident (str): Identificador del navaid (2-10 caracteres, case insensitive)
 
     Returns:
-        str: JSON con los datos del navaid encontrado, o lista de coincidencias
-             si hay múltiples navaids con el mismo ident.
+        str: JSON con listas 'vors' y 'ndbs' con los resultados encontrados.
     """
     try:
-        data = await _get("/api/navaid/info", {"ident": ident.upper()})
-        return _fmt(data)
+        ident_upper = ident.upper()
+
+        vors = _db_query(
+            """
+            SELECT ident, name, frequency, range, mag_var,
+                   lonx AS lon, laty AS lat, region, type
+            FROM vor
+            WHERE ident = ?
+            ORDER BY name
+            """,
+            (ident_upper,)
+        )
+
+        ndbs = _db_query(
+            """
+            SELECT ident, name, frequency, range,
+                   lonx AS lon, laty AS lat, region, type
+            FROM ndb
+            WHERE ident = ?
+            ORDER BY name
+            """,
+            (ident_upper,)
+        )
+
+        return _fmt({
+            "ident": ident_upper,
+            "vors": vors,
+            "ndbs": ndbs,
+            "total": len(vors) + len(ndbs),
+        })
     except Exception as e:
         return _err(e)
 
 
 @mcp.tool(
-    name="lnm_aircraft_progress",
-    annotations={
-        "title": "Progreso de vuelo en tiempo real",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
+    name="lnm_map_features",
+    annotations={"title": "Navaids y aeropuertos en una región", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
-async def lnm_aircraft_progress() -> str:
-    """Obtiene datos de progreso de vuelo del aircraft activo en el simulador.
+def lnm_map_features(params: MapFeaturesInput) -> str:
+    """Obtiene VORs, NDBs y aeropuertos dentro de un rectángulo geográfico.
 
-    Incluye información sobre el leg activo, próximo waypoint, distancia y
-    tiempo estimado a destino, bearing, altitud requerida, fuel restante y
-    estado de climb/descent. Equivale a la pestaña Progress de LNM.
+    Consulta directamente el SQLite de LNM (las tablas vor, ndb y airport).
+    Útil para planificación de rutas VOR-to-VOR o identificar navaids en
+    una región de interés.
 
-    Requiere simulador conectado y flight plan cargado en LNM.
+    Nota: Este endpoint no existe en la WebAPI de LNM 3.0.18 — se accede
+    directamente al SQLite en LNM_DB_PATH.
+
+    Args:
+        params (MapFeaturesInput): Rectángulo definido por:
+            - toplat (float): Latitud norte
+            - bottomlat (float): Latitud sur
+            - leftlon (float): Longitud oeste
+            - rightlon (float): Longitud este
 
     Returns:
-        str: JSON con datos de progreso: waypoint activo, bearing to next,
-             distance remaining, ETE, fuel state y altitude requirements.
+        str: JSON con arrays 'vors', 'ndbs' y 'airports' dentro del rectángulo.
     """
     try:
-        data = await _get("/api/aircraft/progress")
-        return _fmt(data)
+        lat_min = min(params.toplat, params.bottomlat)
+        lat_max = max(params.toplat, params.bottomlat)
+        lon_min = min(params.leftlon, params.rightlon)
+        lon_max = max(params.leftlon, params.rightlon)
+
+        bounds = (lat_min, lat_max, lon_min, lon_max)
+
+        vors = _db_query(
+            """
+            SELECT ident, name, frequency, range, mag_var,
+                   lonx AS lon, laty AS lat, region, type
+            FROM vor
+            WHERE laty BETWEEN ? AND ?
+              AND lonx BETWEEN ? AND ?
+            ORDER BY ident
+            """,
+            bounds
+        )
+
+        ndbs = _db_query(
+            """
+            SELECT ident, name, frequency, range,
+                   lonx AS lon, laty AS lat, region, type
+            FROM ndb
+            WHERE laty BETWEEN ? AND ?
+              AND lonx BETWEEN ? AND ?
+            ORDER BY ident
+            """,
+            bounds
+        )
+
+        airports = _db_query(
+            """
+            SELECT ident, name, elevation,
+                   lonx AS lon, laty AS lat, country, state,
+                   num_runway_hard, num_runway_soft, longest_runway_length
+            FROM airport
+            WHERE laty BETWEEN ? AND ?
+              AND lonx BETWEEN ? AND ?
+            ORDER BY ident
+            """,
+            bounds
+        )
+
+        return _fmt({
+            "bbox": {"lat_min": lat_min, "lat_max": lat_max,
+                     "lon_min": lon_min, "lon_max": lon_max},
+            "vors": vors,
+            "ndbs": ndbs,
+            "airports": airports,
+            "totals": {"vors": len(vors), "ndbs": len(ndbs), "airports": len(airports)},
+        })
     except Exception as e:
         return _err(e)
 
+
+# ─── Tool — Status (WebAPI + SQLite) ─────────────────────────────────────────
 
 @mcp.tool(
     name="lnm_status",
-    annotations={
-        "title": "Estado general de LNM",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": False,
-        "openWorldHint": False,
-    },
+    annotations={"title": "Estado general de LNM", "readOnlyHint": True,
+                 "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
 )
 async def lnm_status() -> str:
-    """Verifica si Little Navmap está corriendo y el web server activo.
+    """Verifica el estado de Little Navmap: conectividad WebAPI y accesibilidad del SQLite.
 
-    Hace un ping a la interfaz web de LNM y devuelve el estado de conectividad.
-    Útil como health check antes de otras operaciones.
+    Comprueba dos cosas independientemente:
+    - WebAPI: hace ping al web server de LNM en BASE_URL
+    - SQLite: verifica que el archivo .sqlite existe y es accesible
 
     Returns:
-        str: JSON con status (ok/error), URL del web server y mensaje descriptivo.
+        str: JSON con estado de webapi y sqlite, rutas usadas y mensajes descriptivos.
     """
+    result = {
+        "webapi": {"status": "error", "base_url": BASE_URL, "message": ""},
+        "sqlite": {"status": "error", "path": LNM_DB_PATH, "message": ""},
+    }
+
+    # Check WebAPI
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(f"{BASE_URL}/")
-            status = "ok" if response.status_code < 400 else "error"
-            return _fmt({
-                "status": status,
-                "http_code": response.status_code,
-                "base_url": BASE_URL,
-                "message": "Little Navmap web server alcanzable." if status == "ok"
-                           else f"LNM responde con HTTP {response.status_code}.",
-            })
+            if response.status_code < 400:
+                result["webapi"]["status"] = "ok"
+                result["webapi"]["message"] = "LNM web server alcanzable."
+            else:
+                result["webapi"]["message"] = f"HTTP {response.status_code}."
     except httpx.ConnectError:
-        return _fmt({
-            "status": "error",
-            "base_url": BASE_URL,
-            "message": (
-                f"Little Navmap no responde en {BASE_URL}. "
-                "Verifica que LNM esté abierto y el web server activo "
-                "(Tools → Run Web Server)."
-            ),
-        })
+        result["webapi"]["message"] = (
+            "LNM no responde. Verifica que esté abierto y el web server activo "
+            "(Tools → Run Web Server)."
+        )
     except Exception as e:
-        return _fmt({"status": "error", "message": str(e)})
+        result["webapi"]["message"] = str(e)
+
+    # Check SQLite
+    try:
+        rows = _db_query("SELECT COUNT(*) AS n FROM vor")
+        result["sqlite"]["status"] = "ok"
+        result["sqlite"]["message"] = f"SQLite accesible. {rows[0]['n']} VORs en base de datos."
+    except Exception as e:
+        result["sqlite"]["message"] = str(e)
+
+    overall = "ok" if all(v["status"] == "ok" for v in result.values()) else "partial" \
+              if any(v["status"] == "ok" for v in result.values()) else "error"
+    result["overall"] = overall
+
+    return _fmt(result)
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
